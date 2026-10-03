@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings>
+    <setting propertyKey="@Properties.accentColor" title="@Strings.Accent">
+        <settingConfig type="list">
+            <listEntry value="0">@Strings.Cyan</listEntry>
+            <listEntry value="1">@Strings.Yellow</listEntry>
+            <listEntry value="2">@Strings.Green</listEntry>
+            <listEntry value="3">@Strings.White</listEntry>
+        </settingConfig>
+    </setting>
+    <setting propertyKey="@Properties.chinese" title="@Strings.Chinese"><settingConfig type="boolean" /></setting>
+    <setting propertyKey="@Properties.hours24" title="@Strings.Hours24"><settingConfig type="boolean" /></setting>
+    <setting propertyKey="@Properties.showSeconds" title="@Strings.Seconds"><settingConfig type="boolean" /></setting>
+    <setting propertyKey="@Properties.showLines" title="@Strings.Lines"><settingConfig type="boolean" /></setting>
+    <setting propertyKey="@Properties.slot1" title="@Strings.Slot1"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot2" title="@Strings.Slot2"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot3" title="@Strings.Slot3"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot4" title="@Strings.Slot4"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot5" title="@Strings.Slot5"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot6" title="@Strings.Slot6"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot7" title="@Strings.Slot7"><settingConfig type="numeric" min="0" max="13" /></setting>
+    <setting propertyKey="@Properties.slot8" title="@Strings.Slot8"><settingConfig type="numeric" min="0" max="13" /></setting>
+</settings>

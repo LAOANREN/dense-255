@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<iq:manifest version="3" xmlns:iq="http://www.garmin.com/xml/connectiq">
+    <iq:application id="a38125d7974e4bf1b238ad39d526e408"
+        type="watchface" name="@Strings.AppName" entry="KnightFaceApp"
+        launcherIcon="@Drawables.LauncherIcon" minApiLevel="3.2.0">
+        <iq:products><iq:product id="fr255" /></iq:products>
+        <iq:permissions>
+            <iq:uses-permission id="UserProfile" />
+        </iq:permissions>
+        <iq:languages>
+            <iq:language>eng</iq:language>
+            <iq:language>zhs</iq:language>
+        </iq:languages>
+        <iq:barrels />
+    </iq:application>
+</iq:manifest>
