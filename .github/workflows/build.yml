@@ -1,0 +1,133 @@
+name: Build Dense 255
+
+on:
+  workflow_dispatch:
+    inputs:
+      theme:
+        description: "Accent: cyan / yellow / green / white"
+        type: choice
+        options: [cyan, yellow, green, white]
+        default: cyan
+      language:
+        description: "Labels: zh = Chinese, en = English"
+        type: choice
+        options: [zh, en]
+        default: zh
+      slots:
+        description: "Eight slots, row by row. See README for IDs 0-13"
+        type: string
+        default: "1,3,2,5,4,6,7,8"
+      hours:
+        description: "Clock format"
+        type: choice
+        options: ["24", "12"]
+        default: "24"
+      seconds:
+        description: "Show seconds while awake"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Public third-party SDK image found in Garmin's developer forum.
+      # Availability, current SDK version, and fr255 device files are NOT verified here.
+      CIQ_IMAGE: ghcr.io/matco/connectiq-tester:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Assemble project and validate resources
+        env:
+          FACE_THEME: ${{ inputs.theme }}
+          FACE_LANGUAGE: ${{ inputs.language }}
+          FACE_SLOTS: ${{ inputs.slots }}
+          FACE_HOURS: ${{ inputs.hours }}
+          FACE_SECONDS: ${{ inputs.seconds }}
+        run: |
+          mkdir -p out
+          python prepare_project.py 2>&1 | tee out/prepare.log
+
+      - name: Prepare signing key
+        env:
+          CIQ_KEY_B64: ${{ secrets.CIQ_DEVELOPER_KEY_B64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ciq-signing"
+          chmod 700 "$RUNNER_TEMP/ciq-signing"
+          if [ -n "$CIQ_KEY_B64" ]; then
+            printf '%s' "$CIQ_KEY_B64" | base64 --decode > "$RUNNER_TEMP/ciq-signing/developer_key.der"
+          else
+            openssl genrsa -out "$RUNNER_TEMP/ciq-signing/key.pem" 4096
+            openssl pkcs8 -topk8 -inform PEM -outform DER -in "$RUNNER_TEMP/ciq-signing/key.pem" -out "$RUNNER_TEMP/ciq-signing/developer_key.der" -nocrypt
+            rm "$RUNNER_TEMP/ciq-signing/key.pem"
+            echo '::notice::Using a temporary signing key. Future builds may require reinstalling the watch face.'
+          fi
+          chmod 600 "$RUNNER_TEMP/ciq-signing/developer_key.der"
+          openssl pkey -inform DER -in "$RUNNER_TEMP/ciq-signing/developer_key.der" -check -noout
+
+      - name: Obtain SDK image
+        run: |
+          docker pull "$CIQ_IMAGE" 2>&1 | tee out/sdk-download.log
+          docker image inspect "$CIQ_IMAGE" --format '{{json .RepoDigests}}' > out/sdk-image-digest.txt
+
+      - name: Compile for Forerunner 255
+        run: |
+          docker run --rm --user 0:0 --entrypoint /bin/sh \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$RUNNER_TEMP/ciq-signing:/signing:ro" \
+            -w /work/project \
+            "$CIQ_IMAGE" -c '
+              set -eu
+              COMPILER=$(command -v monkeyc || true)
+              if [ -z "$COMPILER" ]; then
+                COMPILER=$(find / -type f -name monkeyc 2>/dev/null | head -n 1)
+              fi
+              if [ -z "$COMPILER" ]; then
+                echo "No monkeyc found in SDK image. See build documentation."
+                exit 1
+              fi
+              echo "Compiler: $COMPILER"
+              "$COMPILER" -f monkey.jungle -d fr255 \
+                -y /signing/developer_key.der \
+                -o /work/out/Dense255.prg -w
+            ' 2>&1 | tee out/compiler.log
+          test -s out/Dense255.prg
+          sha256sum out/Dense255.prg > out/Dense255.sha256
+
+      - name: Upload compiled program
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dense255-fr255-program
+          path: |
+            out/Dense255.prg
+            out/Dense255.sha256
+            out/build-config.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload logs and assembled source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dense255-source-and-logs
+          path: |
+            out/*.log
+            out/*.txt
+            out/Dense255-source.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ciq-signing/developer_key.der"
