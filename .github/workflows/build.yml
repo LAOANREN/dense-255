@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       theme:
-        description: "Accent: cyan / yellow / green / white"
+        description: "Accent color"
         type: choice
         options: [cyan, yellow, green, white]
         default: cyan
       language:
-        description: "Labels: zh = Chinese, en = English"
+        description: "Labels: zh or en"
         type: choice
         options: [zh, en]
         default: zh
       slots:
-        description: "Eight slots, row by row. See README for IDs 0-13"
+        description: "Eight data slots, IDs 0-13"
         type: string
         default: "1,3,2,5,4,6,7,8"
       hours:
@@ -26,6 +26,10 @@ on:
         description: "Show seconds while awake"
         type: boolean
         default: true
+      create_signing_key:
+        description: "FIRST IQ BUILD ONLY: create key if no encrypted backup exists"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -35,8 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # Public third-party SDK image found in Garmin's developer forum.
-      # Availability, current SDK version, and fr255 device files are NOT verified here.
       CIQ_IMAGE: ghcr.io/matco/connectiq-tester:latest
     steps:
       - name: Checkout
@@ -58,29 +60,56 @@ jobs:
           mkdir -p out
           python prepare_project.py 2>&1 | tee out/prepare.log
 
-      - name: Prepare signing key
+      - name: Restore or create persistent signing key
         env:
-          CIQ_KEY_B64: ${{ secrets.CIQ_DEVELOPER_KEY_B64 }}
+          KEY_PASSWORD: ${{ secrets.CIQ_KEY_PASSWORD }}
+          CREATE_KEY: ${{ inputs.create_signing_key }}
         run: |
-          mkdir -p "$RUNNER_TEMP/ciq-signing"
-          chmod 700 "$RUNNER_TEMP/ciq-signing"
-          if [ -n "$CIQ_KEY_B64" ]; then
-            printf '%s' "$CIQ_KEY_B64" | base64 --decode > "$RUNNER_TEMP/ciq-signing/developer_key.der"
-          else
-            openssl genrsa -out "$RUNNER_TEMP/ciq-signing/key.pem" 4096
-            openssl pkcs8 -topk8 -inform PEM -outform DER -in "$RUNNER_TEMP/ciq-signing/key.pem" -out "$RUNNER_TEMP/ciq-signing/developer_key.der" -nocrypt
-            rm "$RUNNER_TEMP/ciq-signing/key.pem"
-            echo '::notice::Using a temporary signing key. Future builds may require reinstalling the watch face.'
+          set -euo pipefail
+          if [ "${#KEY_PASSWORD}" -lt 20 ]; then
+            echo "::error::Set repository Actions secret CIQ_KEY_PASSWORD to a strong password of at least 20 characters."
+            exit 1
           fi
-          chmod 600 "$RUNNER_TEMP/ciq-signing/developer_key.der"
-          openssl pkey -inform DER -in "$RUNNER_TEMP/ciq-signing/developer_key.der" -check -noout
+          KEY_DIR="$RUNNER_TEMP/ciq-signing"
+          mkdir -p "$KEY_DIR"
+          chmod 700 "$KEY_DIR"
+          umask 077
+          trap 'rm -f "$KEY_DIR/plain.pem"' EXIT
+          if [ -f developer-key.encrypted.pem ]; then
+            openssl pkcs8 -in developer-key.encrypted.pem \
+              -passin env:KEY_PASSWORD -out "$KEY_DIR/plain.pem"
+          elif [ "$CREATE_KEY" = "true" ]; then
+            openssl genrsa -out "$KEY_DIR/plain.pem" 4096
+            echo "::notice::New signing key created. Save the encrypted backup and upload it to the repository root before future builds."
+          else
+            echo "::error::Missing developer-key.encrypted.pem. Restore your backup; only for the FIRST IQ build enable create_signing_key."
+            exit 1
+          fi
+          openssl pkey -in "$KEY_DIR/plain.pem" -check -noout
+          openssl pkcs8 -topk8 -in "$KEY_DIR/plain.pem" \
+            -outform DER -nocrypt -out "$KEY_DIR/developer_key.der"
+          openssl pkcs8 -topk8 -in "$KEY_DIR/plain.pem" \
+            -v2 aes-256-cbc -iter 200000 -passout env:KEY_PASSWORD \
+            -out out/developer-key.encrypted.pem
+          openssl pkey -in "$KEY_DIR/plain.pem" -pubout -outform DER \
+            | openssl dgst -sha256 > out/signing-public-key.sha256
+
+      - name: Upload encrypted signing backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dense255-signing-backup
+          path: |
+            out/developer-key.encrypted.pem
+            out/signing-public-key.sha256
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Obtain SDK image
         run: |
           docker pull "$CIQ_IMAGE" 2>&1 | tee out/sdk-download.log
           docker image inspect "$CIQ_IMAGE" --format '{{json .RepoDigests}}' > out/sdk-image-digest.txt
 
-      - name: Compile for Forerunner 255
+      - name: Compile PRG and export IQ
         run: |
           docker run --rm --user 0:0 --entrypoint /bin/sh \
             -v "$GITHUB_WORKSPACE:/work" \
@@ -93,28 +122,31 @@ jobs:
                 COMPILER=$(find / -type f -name monkeyc 2>/dev/null | head -n 1)
               fi
               if [ -z "$COMPILER" ]; then
-                echo "No monkeyc found in SDK image. See build documentation."
+                echo "No monkeyc found in SDK image."
                 exit 1
               fi
-              echo "Compiler: $COMPILER"
               "$COMPILER" -f monkey.jungle -d fr255 \
                 -y /signing/developer_key.der \
                 -o /work/out/Dense255.prg -w
+              "$COMPILER" -e -f monkey.jungle \
+                -y /signing/developer_key.der \
+                -o /work/out/Dense255.iq -w
             ' 2>&1 | tee out/compiler.log
           test -s out/Dense255.prg
-          sha256sum out/Dense255.prg > out/Dense255.sha256
+          test -s out/Dense255.iq
+          sha256sum out/Dense255.prg out/Dense255.iq > out/Dense255.sha256
 
-      - name: Upload compiled program
-        if: success()
+      - name: Upload compiled PRG and IQ
         uses: actions/upload-artifact@v4
         with:
-          name: Dense255-fr255-program
+          name: Dense255-install-files
           path: |
             out/Dense255.prg
+            out/Dense255.iq
             out/Dense255.sha256
             out/build-config.txt
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Upload logs and assembled source
         if: always()
@@ -128,6 +160,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Remove signing key
+      - name: Remove temporary signing files
         if: always()
-        run: rm -f "$RUNNER_TEMP/ciq-signing/developer_key.der"
+        run: |
+          rm -f "$RUNNER_TEMP/ciq-signing/developer_key.der"
+          rm -f "$RUNNER_TEMP/ciq-signing/plain.pem"
