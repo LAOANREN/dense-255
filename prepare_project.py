@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Assemble the Dense 255 photo watch face into a Connect IQ project.
+"""Assemble the Dense 255 data-grid watch face into a Connect IQ project.
 
 Python 3, standard library only. This script assembles source/resources;
-it does not compile a PRG. The existing GitHub Actions workflow runs monkeyc.
-
-Place kipchoge.jpg and kipchoge.xml in the repository root alongside this file.
-The photo remains JPEG; icon.png is the separate, generated launcher icon.
+the existing GitHub Actions workflow runs monkeyc afterwards.
+No photo, portrait, or extra bitmap/XML inputs are required.
 """
 from pathlib import Path
 import os
@@ -45,7 +43,7 @@ def xml_write(path, root):
 
 
 def png_icon(path):
-    # Original 40x40 launcher icon. This is independent of the JPEG photo.
+    # Generate the existing 40x40 launcher icon with the standard library.
     size = 40
     pixels = bytearray()
     for y in range(size):
@@ -74,52 +72,20 @@ def png_icon(path):
     )
 
 
-def validate_photo_resource(path):
-    # Catch the most common upload/name mistakes before invoking monkeyc.
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as error:
-        raise SystemExit(f"Invalid kipchoge.xml: {error}") from error
-    bitmaps = [
-        item for item in root.iter("bitmap")
-        if item.get("id") == "KipchogeBackground"
-    ]
-    if len(bitmaps) != 1:
-        raise SystemExit(
-            "kipchoge.xml must contain exactly one bitmap with "
-            'id="KipchogeBackground".'
-        )
-    if bitmaps[0].get("filename") != "kipchoge.jpg":
-        raise SystemExit(
-            'The KipchogeBackground bitmap must use filename="kipchoge.jpg".'
-        )
-
-
 def main():
     if PROJECT.exists():
         raise SystemExit("project/ already exists; use a fresh working folder.")
 
+    # Copy only these five inputs. Unused root-level image/XML files are ignored.
     inputs = {
         "source/KnightFace.mc": select("KnightFace.mc", "KnightFace v2.mc"),
         "source/KnightFaceApp.mc": select("KnightFaceApp.mc", "KnightFaceApp v2.mc"),
         "manifest.xml": select("manifest.xml", "manifest v2.xml"),
         "monkey.jungle": select("monkey.jungle", "monkey v2.jungle"),
         "resources/settings/settings.xml": select("settings.xml", "settings v2.xml"),
-        "resources/drawables/kipchoge.xml": ROOT / "kipchoge.xml",
-        "resources/drawables/kipchoge.jpg": ROOT / "kipchoge.jpg",
     }
 
-    for source_path in inputs.values():
-        if not source_path.is_file():
-            raise SystemExit(
-                f"Missing input file: {source_path.name}. "
-                "Upload it to the repository root next to prepare_project.py."
-            )
-
-    validate_photo_resource(inputs["resources/drawables/kipchoge.xml"])
-
     source = inputs["source/KnightFace.mc"].read_text(encoding="utf-8")
-    # The photo layout no longer has the old _slots grid variable.
     if "Gregorian.info" not in source or "App.Properties.getValue" not in source:
         raise SystemExit(
             "Invalid KnightFace source: missing Gregorian.info "
@@ -136,12 +102,15 @@ def main():
     if lang not in ("zh", "en"):
         raise SystemExit("FACE_LANGUAGE must be zh or en")
 
-    # Keep the existing workflow/settings interface compatible. The photo
-    # watch face ignores these slots, but the settings file still defines them.
-    slots = [
-        int(s.strip())
-        for s in os.environ.get("FACE_SLOTS", "1,3,2,5,4,6,7,8").split(",")
-    ]
+    # Keep old settings/workflow fields compatible. The restored view uses its
+    # fixed grid: steps/altitude, distance/calories, heart rate/ambient pressure.
+    try:
+        slots = [
+            int(s.strip())
+            for s in os.environ.get("FACE_SLOTS", "1,13,2,3,4,12,7,8").split(",")
+        ]
+    except ValueError as error:
+        raise SystemExit("FACE_SLOTS requires eight comma-separated integers from 0 to 13") from error
     if len(slots) != 8 or any(s < 0 or s > 13 for s in slots):
         raise SystemExit("FACE_SLOTS requires eight comma-separated integers from 0 to 13")
     hours = os.environ.get("FACE_HOURS", "24")
@@ -190,7 +159,6 @@ def main():
         ET.SubElement(strings, "string", {"id": key}).text = label
     xml_write(PROJECT / "resources/strings/strings.xml", strings)
 
-    # kipchoge.xml is a separate resource file already copied above.
     drawables = ET.Element("drawables")
     ET.SubElement(drawables, "bitmap", {"id": "LauncherIcon", "filename": "icon.png"})
     xml_write(PROJECT / "resources/drawables/drawables.xml", drawables)
@@ -211,7 +179,8 @@ def main():
     OUT.mkdir(exist_ok=True)
     config = (
         f"device=fr255\ntheme={theme}\nlanguage={lang}\nslots={slots}\n"
-        f"hours={hours}\nseconds={seconds}\nbackground=kipchoge.jpg\n"
+        f"hours={hours}\nseconds={seconds}\nbackground=none\n"
+        "grid=steps,altitude,distance,calories,heartRate,ambientPressure\n"
     )
     (OUT / "build-config.txt").write_text(config, encoding="utf-8")
     with zipfile.ZipFile(OUT / "Dense255-source.zip", "w", zipfile.ZIP_DEFLATED) as bundle:
@@ -219,7 +188,7 @@ def main():
             if path.is_file():
                 bundle.write(path, path.relative_to(PROJECT))
     print("Project assembled; XML and resource references checked. No PRG has been built yet.")
-    print("Photo resources copied: kipchoge.jpg and kipchoge.xml")
+    print("Data grid restored. No photo resources required.")
     print(config)
 
 
