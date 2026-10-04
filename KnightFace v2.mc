@@ -6,7 +6,6 @@ using Toybox.Time.Gregorian as Gregorian;
 using Toybox.WatchUi as Ui;
 using Toybox.Activity as Activity;
 using Toybox.ActivityMonitor as AM;
-using Toybox.Sensor as Sensor;
 using Toybox.Weather as Weather;
 using Toybox.Math as Math;
 
@@ -20,8 +19,8 @@ using Toybox.Math as Math;
 //
 // A watch face cannot start a continuous GPS acquisition on Connect IQ.
 // The heading code therefore uses the latest heading exposed by the current
-// activity and falls back to the watch compass sensor.  A device app or a
-// widget is required if a permanently live GPS heading is mandatory.
+// activity and falls back to its travel bearing.  A device app or a widget
+// is required if a permanently live GPS heading is mandatory.
 class KnightFace extends Ui.WatchFace {
     var _awake = true;
     var _dataMinute = -1;
@@ -29,7 +28,6 @@ class KnightFace extends Ui.WatchFace {
 
     var _info = null;
     var _weather = null;
-    var _sensor = null;
     var _heart = null;
     var _battery = null;
     var _altitude = null;
@@ -172,36 +170,33 @@ class KnightFace extends Ui.WatchFace {
             _weather = null;
         }
 
-        _sensor = Sensor.getInfo();
+        var activityInfo = Activity.getActivityInfo();
 
         _pressure = null;
-        if (_sensor != null && _sensor.pressure != null) {
-            // Sensor pressure is reported in Pa; the face displays hPa.
-            _pressure = _sensor.pressure / 100.0;
+        if (activityInfo != null &&
+            activityInfo.ambientPressure != null) {
+            // Activity ambient pressure is reported in Pa; the face displays hPa.
+            _pressure = activityInfo.ambientPressure / 100.0;
         }
 
         // The lower grid calls this value 海拔.  It is current elevation,
         // rather than ActivityMonitor.metersClimbed, which is a daily stair
         // climbing total.  The requested offline behavior is --.
         _altitude = null;
-        if (_phone) {
-            var activityInfo = Activity.getActivityInfo();
-
-            if (activityInfo != null && activityInfo.altitude != null) {
-                _altitude = activityInfo.altitude;
-            } else if (_sensor != null && _sensor.altitude != null) {
-                _altitude = _sensor.altitude;
-            }
+        if (_phone &&
+            activityInfo != null &&
+            activityInfo.altitude != null) {
+            _altitude = activityInfo.altitude;
         }
 
         _heart = null;
 
-        // Prefer a current sensor value, then use the recent history cache.
-        if (_sensor != null &&
-            _sensor.heartRate != null &&
-            _sensor.heartRate > 0 &&
-            _sensor.heartRate < 255) {
-            _heart = _sensor.heartRate;
+        // Prefer the current activity heart rate, then use the recent history cache.
+        if (activityInfo != null &&
+            activityInfo.currentHeartRate != null &&
+            activityInfo.currentHeartRate > 0 &&
+            activityInfo.currentHeartRate < 255) {
+            _heart = activityInfo.currentHeartRate;
         }
 
         if (_heart == null) {
@@ -247,27 +242,20 @@ class KnightFace extends Ui.WatchFace {
         }
     }
 
-    // A watch face cannot request a live GPS stream.  Activity.Info.currentHeading
-    // is the latest true-north heading supplied by the activity system.  The
-    // sensor heading provides a compass fallback when the watch supports it.
+    // A watch face cannot request a live GPS stream.  Use the latest true-north
+    // heading from an active/recent activity and fall back to its travel bearing.
     function refreshHeading() {
         var heading = null;
         var activityInfo = Activity.getActivityInfo();
 
         if (activityInfo != null && activityInfo.currentHeading != null) {
             heading = activityInfo.currentHeading;
+        } else if (activityInfo != null && activityInfo.bearing != null) {
+            heading = activityInfo.bearing;
         }
 
-        if (heading == null) {
-            var sensorInfo = Sensor.getInfo();
-
-            if (sensorInfo != null && sensorInfo.heading != null) {
-                heading = sensorInfo.heading;
-            }
-        }
-
-        // Keep the last good value during a short sensor gap.  A fresh install
-        // with no heading data still shows -- and no misleading pointer.
+        // Keep the last good value during a short activity data gap.  A fresh
+        // install with no activity heading still shows -- and no fake pointer.
         if (heading != null) {
             _heading = heading;
         }
