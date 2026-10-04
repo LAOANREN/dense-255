@@ -1,18 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <resources>
-    <!--
-        将本文件放在 resources/drawables/kipchoge.xml。
-        将用户提供的人物原图以 JPEG 格式保存为同目录的 kipchoge.jpg。
-        本文件新增独立位图资源，不替换项目原有的 drawables.xml。
-        针对 260 x 260 的 Forerunner 255 标准版编译。
-        原图应保持用户提供的方形构图，不要提前裁成小头像。
-    -->
     <bitmap id="KipchogeBackground"
             filename="kipchoge.jpg"
             scaleX="260"
             scaleY="260"
             dithering="floyd_steinberg">
-        <!-- 16 色、不使用透明色，让编译器可采用 4 bpp。 -->
         <palette disableTransparency="true">
             <color>000000</color>
             <color>555555</color>
