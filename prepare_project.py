@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Assemble the attached source files into a CIQ project. Python 3, standard library only.
-This script creates source/resources, not a PRG. monkeyc must compile it afterwards.
+"""Assemble the Dense 255 photo watch face into a Connect IQ project.
+
+Python 3, standard library only. This script assembles source/resources;
+it does not compile a PRG. The existing GitHub Actions workflow runs monkeyc.
+
+Place kipchoge.jpg and kipchoge.xml in the repository root alongside this file.
+The photo remains JPEG; icon.png is the separate, generated launcher icon.
 """
 from pathlib import Path
 import os
@@ -19,7 +24,10 @@ OUT = ROOT / "out"
 def select(canonical, versioned):
     matches = [ROOT / n for n in (canonical, versioned) if (ROOT / n).is_file()]
     if len(matches) != 1:
-        raise SystemExit(f"Upload exactly one of {canonical!r} or {versioned!r}; found {len(matches)}")
+        raise SystemExit(
+            f"Upload exactly one of {canonical!r} or {versioned!r}; "
+            f"found {len(matches)}"
+        )
     return matches[0]
 
 
@@ -37,7 +45,7 @@ def xml_write(path, root):
 
 
 def png_icon(path):
-    # Original 40x40 RGB icon. No external image tools or downloaded assets.
+    # Original 40x40 launcher icon. This is independent of the JPEG photo.
     size = 40
     pixels = bytearray()
     for y in range(size):
@@ -45,29 +53,81 @@ def png_icon(path):
         for x in range(size):
             d2 = (x - 19.5) ** 2 + (y - 19.5) ** 2
             ring = 14 ** 2 <= d2 <= 17 ** 2
-            hand = (18 <= x <= 21 and 9 <= y <= 21) or (19 <= x <= 29 and 18 <= y <= 21)
+            hand = (18 <= x <= 21 and 9 <= y <= 21) or (
+                19 <= x <= 29 and 18 <= y <= 21
+            )
             pixels.extend((0, 170, 255) if ring or hand else (0, 0, 0))
+
     def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
-                     + chunk(b"IDAT", zlib.compress(bytes(pixels))) + chunk(b"IEND", b""))
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+        )
+
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(pixels)))
+        + chunk(b"IEND", b"")
+    )
+
+
+def validate_photo_resource(path):
+    # Catch the most common upload/name mistakes before invoking monkeyc.
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as error:
+        raise SystemExit(f"Invalid kipchoge.xml: {error}") from error
+    bitmaps = [
+        item for item in root.iter("bitmap")
+        if item.get("id") == "KipchogeBackground"
+    ]
+    if len(bitmaps) != 1:
+        raise SystemExit(
+            "kipchoge.xml must contain exactly one bitmap with "
+            'id="KipchogeBackground".'
+        )
+    if bitmaps[0].get("filename") != "kipchoge.jpg":
+        raise SystemExit(
+            'The KipchogeBackground bitmap must use filename="kipchoge.jpg".'
+        )
 
 
 def main():
     if PROJECT.exists():
         raise SystemExit("project/ already exists; use a fresh working folder.")
+
     inputs = {
         "source/KnightFace.mc": select("KnightFace.mc", "KnightFace v2.mc"),
         "source/KnightFaceApp.mc": select("KnightFaceApp.mc", "KnightFaceApp v2.mc"),
         "manifest.xml": select("manifest.xml", "manifest v2.xml"),
         "monkey.jungle": select("monkey.jungle", "monkey v2.jungle"),
         "resources/settings/settings.xml": select("settings.xml", "settings v2.xml"),
+        "resources/drawables/kipchoge.xml": ROOT / "kipchoge.xml",
+        "resources/drawables/kipchoge.jpg": ROOT / "kipchoge.jpg",
     }
+
+    for source_path in inputs.values():
+        if not source_path.is_file():
+            raise SystemExit(
+                f"Missing input file: {source_path.name}. "
+                "Upload it to the repository root next to prepare_project.py."
+            )
+
+    validate_photo_resource(inputs["resources/drawables/kipchoge.xml"])
+
     source = inputs["source/KnightFace.mc"].read_text(encoding="utf-8")
-    if "Gregorian.info" not in source or "App.Properties.getValue" not in source or "var _slots" not in source:
-        raise SystemExit("Old draft detected. Upload KnightFace v2.mc from the latest delivery.")
+    # The photo layout no longer has the old _slots grid variable.
+    if "Gregorian.info" not in source or "App.Properties.getValue" not in source:
+        raise SystemExit(
+            "Invalid KnightFace source: missing Gregorian.info "
+            "or App.Properties.getValue."
+        )
     if "FONT_NUMBER_THAI_HOT" in source:
         raise SystemExit("Obsolete font constant detected.")
+
     theme = os.environ.get("FACE_THEME", "cyan")
     themes = {"cyan": 0, "yellow": 1, "green": 2, "white": 3}
     if theme not in themes:
@@ -75,13 +135,20 @@ def main():
     lang = os.environ.get("FACE_LANGUAGE", "zh")
     if lang not in ("zh", "en"):
         raise SystemExit("FACE_LANGUAGE must be zh or en")
-    slots = [int(s.strip()) for s in os.environ.get("FACE_SLOTS", "1,3,2,5,4,6,7,8").split(",")]
+
+    # Keep the existing workflow/settings interface compatible. The photo
+    # watch face ignores these slots, but the settings file still defines them.
+    slots = [
+        int(s.strip())
+        for s in os.environ.get("FACE_SLOTS", "1,3,2,5,4,6,7,8").split(",")
+    ]
     if len(slots) != 8 or any(s < 0 or s > 13 for s in slots):
         raise SystemExit("FACE_SLOTS requires eight comma-separated integers from 0 to 13")
     hours = os.environ.get("FACE_HOURS", "24")
     if hours not in ("12", "24"):
         raise SystemExit("FACE_HOURS must be 12 or 24")
     seconds = flag("FACE_SECONDS", "true")
+
     for relative, source_path in inputs.items():
         dest = PROJECT / relative
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -122,12 +189,14 @@ def main():
     for key, label in labels.items():
         ET.SubElement(strings, "string", {"id": key}).text = label
     xml_write(PROJECT / "resources/strings/strings.xml", strings)
+
+    # kipchoge.xml is a separate resource file already copied above.
     drawables = ET.Element("drawables")
     ET.SubElement(drawables, "bitmap", {"id": "LauncherIcon", "filename": "icon.png"})
     xml_write(PROJECT / "resources/drawables/drawables.xml", drawables)
     png_icon(PROJECT / "resources/drawables/icon.png")
 
-    # Fail early on broken XML/resource references; this is not Monkey C compilation.
+    # These checks do not replace actual Monkey C compilation.
     settings = ET.parse(PROJECT / "resources/settings/settings.xml")
     for item in settings.getroot().findall("setting"):
         key = item.get("propertyKey", "").removeprefix("@Properties.")
@@ -138,14 +207,19 @@ def main():
         for ref in re.findall(r"@Strings\.([A-Za-z0-9_]+)", path.read_text(encoding="utf-8")):
             if ref not in labels:
                 raise SystemExit(f"Unknown string resource: {ref}")
+
     OUT.mkdir(exist_ok=True)
-    config = f"device=fr255\ntheme={theme}\nlanguage={lang}\nslots={slots}\nhours={hours}\nseconds={seconds}\n"
+    config = (
+        f"device=fr255\ntheme={theme}\nlanguage={lang}\nslots={slots}\n"
+        f"hours={hours}\nseconds={seconds}\nbackground=kipchoge.jpg\n"
+    )
     (OUT / "build-config.txt").write_text(config, encoding="utf-8")
     with zipfile.ZipFile(OUT / "Dense255-source.zip", "w", zipfile.ZIP_DEFLATED) as bundle:
         for path in sorted(PROJECT.rglob("*")):
             if path.is_file():
                 bundle.write(path, path.relative_to(PROJECT))
     print("Project assembled; XML and resource references checked. No PRG has been built yet.")
+    print("Photo resources copied: kipchoge.jpg and kipchoge.xml")
     print(config)
 
 
