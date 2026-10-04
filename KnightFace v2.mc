@@ -4,31 +4,49 @@ using Toybox.System as Sys;
 using Toybox.Time as Time;
 using Toybox.Time.Gregorian as Gregorian;
 using Toybox.WatchUi as Ui;
+using Toybox.Activity as Activity;
 using Toybox.ActivityMonitor as AM;
+using Toybox.Sensor as Sensor;
 using Toybox.Weather as Weather;
 using Toybox.Math as Math;
 
-// Original watch face for the standard Forerunner 255.
-// The approved lower layout is a fixed two-column, three-row data grid.
+// KnightFace v2 rebuilt for the Garmin Forerunner 255.
+//
+// The display is 260 x 260 on the Forerunner 255.  The layout follows the
+// supplied round-face reference: weather at the top, date and large time in
+// the middle, a compass pointer beside the time, the original two-column /
+// three-row data grid below it, and the Kipchoge pixel portrait in the
+// remaining lower area.
+//
+// A watch face cannot start a continuous GPS acquisition on Connect IQ.
+// The heading code therefore uses the latest heading exposed by the current
+// activity and falls back to the watch compass sensor.  A device app or a
+// widget is required if a permanently live GPS heading is mandatory.
 class KnightFace extends Ui.WatchFace {
     var _awake = true;
-    var _stamp = -1;
-    var _weatherStamp = -1;
+    var _dataMinute = -1;
+    var _weatherMinute = -1;
 
     var _info = null;
     var _weather = null;
+    var _sensor = null;
     var _heart = null;
     var _battery = null;
+    var _altitude = null;
+    var _pressure = null;
+    var _heading = null;
     var _phone = false;
 
     var _cn = true;
     var _accent = 0x00FFFF;
-    var _slots = [1, 13, 2, 3, 4, 12, 7, 8];
     var _hours24 = true;
     var _seconds = true;
     var _lines = true;
 
-    // Three-frame wake animation: normal, blink, then a one-pixel nod.
+    // The six cells used by the approved lower layout.
+    var _slots = [1, 13, 2, 3, 4, 12];
+
+    // 0 = normal smile, 1 = blink, 2 = small nod.
     var _animationFrame = 0;
     var _animating = false;
 
@@ -62,15 +80,8 @@ class KnightFace extends Ui.WatchFace {
         }
 
         _accent = colors[index];
-
-        // Keep the approved six-cell layout stable even when an older
-        // installation has saved the previous slot values.
-        var defaults = [1, 13, 2, 3, 4, 12, 7, 8];
-        for (var i = 0; i < 8; i += 1) {
-            _slots[i] = defaults[i];
-        }
-
-        _stamp = -1;
+        _dataMinute = -1;
+        _weatherMinute = -1;
     }
 
     function onEnterSleep() {
@@ -83,8 +94,8 @@ class KnightFace extends Ui.WatchFace {
         _awake = true;
         _animationFrame = 0;
         _animating = true;
-        _stamp = -1;
-        _weatherStamp = -1;
+        _dataMinute = -1;
+        _weatherMinute = -1;
         Ui.requestUpdate();
     }
 
@@ -108,105 +119,187 @@ class KnightFace extends Ui.WatchFace {
         return (value * 1.0).format("%.1f");
     }
 
+    function integerUnit(value, unit) {
+        if (value == null) {
+            return "--";
+        }
+
+        return integer(value) + unit;
+    }
+
+    function decimalUnit(value, unit) {
+        if (value == null) {
+            return "--";
+        }
+
+        return decimal(value) + unit;
+    }
+
     function two(value) {
         return value.format("%02d");
     }
 
-    function refreshData() {
-        var minute = (Time.now().value() / 60).toNumber();
+    function minuteStamp() {
+        return (Time.now().value() / 60).toNumber();
+    }
 
-        if (_stamp == minute) {
+    // Read activity, battery, heart rate, weather, altitude and pressure.
+    // ActivityMonitor calories and distance are day totals and are deliberately
+    // read again once per minute, so the values reset correctly at midnight.
+    function refreshData() {
+        var minute = minuteStamp();
+
+        if (_dataMinute == minute) {
             return;
         }
 
-        _stamp = minute;
+        _dataMinute = minute;
         _info = AM.getInfo();
         _battery = Sys.getSystemStats().battery;
 
+        var settings = Sys.getDeviceSettings();
+        var connected = settings != null && settings.phoneConnected;
         var wasPhoneConnected = _phone;
-        _phone = Sys.getDeviceSettings().phoneConnected;
+        _phone = connected;
 
-        // A newly restored phone connection means Garmin Connect may have
-        // delivered a new weather cache. Force a read on the next pass.
         if (_phone != wasPhoneConnected) {
-            _weatherStamp = -1;
+            _weatherMinute = -1;
+        }
+
+        // Weather is a Garmin Connect phone cache.  Do not keep displaying
+        // stale weather after the phone connection has gone away.
+        if (!_phone) {
+            _weather = null;
+        }
+
+        _sensor = Sensor.getInfo();
+
+        _pressure = null;
+        if (_sensor != null && _sensor.pressure != null) {
+            // Sensor pressure is reported in Pa; the face displays hPa.
+            _pressure = _sensor.pressure / 100.0;
+        }
+
+        // The lower grid calls this value 海拔.  It is current elevation,
+        // rather than ActivityMonitor.metersClimbed, which is a daily stair
+        // climbing total.  The requested offline behavior is --.
+        _altitude = null;
+        if (_phone) {
+            var activityInfo = Activity.getActivityInfo();
+
+            if (activityInfo != null && activityInfo.altitude != null) {
+                _altitude = activityInfo.altitude;
+            } else if (_sensor != null && _sensor.altitude != null) {
+                _altitude = _sensor.altitude;
+            }
         }
 
         _heart = null;
 
-        // Read recent cached heart rate without activating the sensor.
-        var iterator = AM.getHeartRateHistory(
-            new Time.Duration(300),
-            true
-        );
+        // Prefer a current sensor value, then use the recent history cache.
+        if (_sensor != null &&
+            _sensor.heartRate != null &&
+            _sensor.heartRate > 0 &&
+            _sensor.heartRate < 255) {
+            _heart = _sensor.heartRate;
+        }
 
-        for (var j = 0; j < 5; j += 1) {
-            var sample = iterator.next();
+        if (_heart == null) {
+            var iterator = AM.getHeartRateHistory(
+                new Time.Duration(300),
+                true
+            );
 
-            if (sample == null) {
-                break;
-            }
+            for (var j = 0; j < 5; j += 1) {
+                var sample = iterator.next();
 
-            if (sample.heartRate != null &&
-                sample.heartRate > 0 &&
-                sample.heartRate < 255) {
-                _heart = sample.heartRate;
-                break;
+                if (sample == null) {
+                    break;
+                }
+
+                if (sample.heartRate != null &&
+                    sample.heartRate > 0 &&
+                    sample.heartRate < 255) {
+                    _heart = sample.heartRate;
+                    break;
+                }
             }
         }
 
-        // Weather.getCurrentConditions() reads the most recent Garmin
-        // Connect cache; it does not start a network request itself.
-        // Retry empty or incomplete data sooner so a phone sync can
-        // populate the cache.
-        var weatherReady = _weather != null &&
-            (_weather.temperature != null ||
-             _weather.windSpeed != null ||
-             _weather.relativeHumidity != null);
-        var weatherInterval = weatherReady ? 10 : 1;
+        if (_phone) {
+            var weatherReady = _weather != null &&
+                (_weather.temperature != null ||
+                 _weather.windSpeed != null ||
+                 _weather.relativeHumidity != null);
+            var weatherInterval = weatherReady ? 10 : 1;
 
-        if (_weatherStamp == -1 ||
-            minute < _weatherStamp ||
-            minute - _weatherStamp >= weatherInterval) {
-            var cachedWeather = Weather.getCurrentConditions();
+            if (_weatherMinute == -1 ||
+                minute < _weatherMinute ||
+                minute - _weatherMinute >= weatherInterval) {
+                var cachedWeather = Weather.getCurrentConditions();
 
-            if (cachedWeather != null) {
-                _weather = cachedWeather;
+                if (cachedWeather != null) {
+                    _weather = cachedWeather;
+                }
+
+                _weatherMinute = minute;
             }
-
-            _weatherStamp = minute;
         }
     }
 
-    function text(dc, x, y, width, height, value, color, centered) {
-        var font = Gfx.FONT_XTINY;
-        var shown = value;
+    // A watch face cannot request a live GPS stream.  Activity.Info.currentHeading
+    // is the latest true-north heading supplied by the activity system.  The
+    // sensor heading provides a compass fallback when the watch supports it.
+    function refreshHeading() {
+        var heading = null;
+        var activityInfo = Activity.getActivityInfo();
+
+        if (activityInfo != null && activityInfo.currentHeading != null) {
+            heading = activityInfo.currentHeading;
+        }
+
+        if (heading == null) {
+            var sensorInfo = Sensor.getInfo();
+
+            if (sensorInfo != null && sensorInfo.heading != null) {
+                heading = sensorInfo.heading;
+            }
+        }
+
+        // Keep the last good value during a short sensor gap.  A fresh install
+        // with no heading data still shows -- and no misleading pointer.
+        if (heading != null) {
+            _heading = heading;
+        }
+    }
+
+    function fitForDc(dc, value, width, font) {
+        var shown = value == null ? "--" : value;
 
         while (shown.length() > 0 &&
                dc.getTextWidthInPixels(shown, font) > width) {
             shown = shown.substring(0, shown.length() - 1);
         }
 
+        return shown;
+    }
+
+    function text(dc, x, y, width, height, value, color, centered) {
+        var font = Gfx.FONT_XTINY;
+        var shown = fitForDc(dc, value, width, font);
+
         dc.setColor(color, Gfx.COLOR_BLACK);
 
         var textY = y +
             ((height - dc.getFontHeight(font)) / 2).toNumber();
-
         var textX = centered
             ? x + (width / 2).toNumber()
             : x;
-
         var alignment = centered
             ? Gfx.TEXT_JUSTIFY_CENTER
             : Gfx.TEXT_JUSTIFY_LEFT;
 
-        dc.drawText(
-            textX,
-            textY,
-            font,
-            shown,
-            alignment
-        );
+        dc.drawText(textX, textY, font, shown, alignment);
     }
 
     function metricLabel(id) {
@@ -266,42 +359,37 @@ class KnightFace extends Ui.WatchFace {
     }
 
     function metricValue(id) {
-        if (id == 0 || _info == null) {
-            if (id == 8 && _battery != null) {
-                return integer(_battery) + "%";
-            }
-
-            return "--";
-        }
-
         if (id == 1) {
-            return integer(_info.steps);
+            return _info == null ? "--" : integer(_info.steps);
         }
 
         if (id == 2) {
-            var km = _info.distance == null
-                ? null
-                : _info.distance / 100000.0;
+            if (_info == null || _info.distance == null) {
+                return "--";
+            }
 
-            return decimal(km) + "km";
+            // ActivityMonitor distance is in centimeters.
+            return decimalUnit(_info.distance / 100000.0, "km");
         }
 
         if (id == 3) {
-            return integer(_info.calories) + "kcal";
+            return _info == null
+                ? "--"
+                : integerUnit(_info.calories, "kcal");
         }
 
         if (id == 4) {
-            return integer(_heart) + "bpm";
+            return integerUnit(_heart, "bpm");
         }
 
         if (id == 5) {
-            return integer(_info.floorsClimbed);
+            return _info == null ? "--" : integer(_info.floorsClimbed);
         }
 
         if (id == 6) {
             var active = null;
 
-            if (_info.activeMinutesDay != null) {
+            if (_info != null && _info.activeMinutesDay != null) {
                 var minutes = _info.activeMinutesDay;
 
                 if (minutes.moderate != null &&
@@ -317,59 +405,48 @@ class KnightFace extends Ui.WatchFace {
         if (id == 7) {
             var percent = null;
 
-            if (_info.steps != null &&
+            if (_info != null &&
+                _info.steps != null &&
                 _info.stepGoal != null &&
                 _info.stepGoal > 0) {
                 percent = _info.steps * 100.0 /
                     _info.stepGoal;
             }
 
-            return integer(percent) + "%";
+            return integerUnit(percent, "%");
         }
 
         if (id == 8) {
-            return integer(_battery) + "%";
+            return integerUnit(_battery, "%");
         }
 
         if (id == 9) {
             var humidity = _weather == null
                 ? null
                 : _weather.relativeHumidity;
-
-            return integer(humidity) + "%";
+            return integerUnit(humidity, "%");
         }
 
         if (id == 10) {
             var wind = _weather == null
                 ? null
                 : _weather.windSpeed;
-
-            return decimal(wind) + "m/s";
+            return decimalUnit(wind, "m/s");
         }
 
         if (id == 11) {
             var temperature = _weather == null
                 ? null
                 : _weather.temperature;
-
-            return integer(temperature) + "C";
+            return integerUnit(temperature, "C");
         }
 
         if (id == 12) {
-            var pressure = null;
-
-            if (_weather != null &&
-                _weather.pressure != null) {
-                pressure = _weather.pressure / 100.0;
-            }
-
-            return integer(pressure) + "hPa";
+            return integerUnit(_pressure, "hPa");
         }
 
         if (id == 13) {
-            // ActivityMonitor exposes the available climbed-elevation value
-            // on this target. It is presented as 海拔 in the approved layout.
-            return integer(_info.metersClimbed) + "m";
+            return integerUnit(_altitude, "m");
         }
 
         return "--";
@@ -379,22 +456,16 @@ class KnightFace extends Ui.WatchFace {
         var label = metricLabel(id);
         var value = metricValue(id);
         var font = Gfx.FONT_XTINY;
-        var rowHeight = 21;
-        var gap = 3;
-        var valueWidth = dc.getTextWidthInPixels(value, font);
-        var labelWidth = width - valueWidth - gap;
-        var shownLabel = label;
+        var rowHeight = 18;
+        var gap = 2;
+        var shownValue = fitForDc(dc, value, width - 4, font);
+        var valueWidth = dc.getTextWidthInPixels(shownValue, font);
+        var labelWidth = width - valueWidth - gap - 4;
+        var shownLabel = fitForDc(dc, label, labelWidth, font);
 
         if (labelWidth < 0) {
             labelWidth = 0;
-        }
-
-        while (shownLabel.length() > 0 &&
-               dc.getTextWidthInPixels(shownLabel, font) > labelWidth) {
-            shownLabel = shownLabel.substring(
-                0,
-                shownLabel.length() - 1
-            );
+            shownLabel = "";
         }
 
         var textY = y +
@@ -414,249 +485,330 @@ class KnightFace extends Ui.WatchFace {
             x + width - 2,
             textY,
             font,
-            value,
+            shownValue,
             Gfx.TEXT_JUSTIFY_RIGHT
         );
     }
 
-    function drawBattery(dc, x, y, percent) {
-        var level = percent == null ? 0 : percent;
-
-        if (level < 0) {
-            level = 0;
+    function directionIndex() {
+        if (_heading == null) {
+            return -1;
         }
 
-        if (level > 100) {
-            level = 100;
+        // Connect IQ headings are radians clockwise from true north.
+        var degrees = _heading * 57.2957795;
+
+        while (degrees < 0) {
+            degrees += 360.0;
         }
 
-        var fill = (12 * level / 100).toNumber();
-
-        dc.setColor(Gfx.COLOR_LT_GRAY, Gfx.COLOR_BLACK);
-        dc.drawLine(x, y, x + 14, y);
-        dc.drawLine(x, y + 8, x + 14, y + 8);
-        dc.drawLine(x, y, x, y + 8);
-        dc.drawLine(x + 14, y, x + 14, y + 8);
-        dc.drawLine(x + 15, y + 2, x + 17, y + 2);
-        dc.drawLine(x + 15, y + 6, x + 17, y + 6);
-
-        if (fill > 0) {
-            dc.setColor(_accent, Gfx.COLOR_BLACK);
-            dc.fillRectangle(x + 2, y + 2, fill, 5);
+        while (degrees >= 360.0) {
+            degrees -= 360.0;
         }
+
+        var index = Math.round((degrees + 22.5) / 45.0).toNumber();
+
+        if (index >= 8) {
+            index = 0;
+        }
+
+        return index;
     }
 
-    // A compact pixel-style portrait of Eliud Kipchoge. The three frames
-    // close the eyes and then move the head down by one pixel.
-    function drawKipchogeAvatar(dc, cx, cy, frame) {
-        var nod = frame == 2 ? 1 : 0;
-        var skin = 0x6B3F2A;
-        var skinLight = 0x986548;
-        var hair = 0x151515;
-        var shirt = Gfx.COLOR_WHITE;
-        var kitRed = 0xD62828;
-        var kitGreen = 0x168B45;
-
-        // Athletic shoulders and a simple red/green running-kit accent.
-        dc.setColor(shirt, Gfx.COLOR_BLACK);
-        dc.fillCircle(cx, cy + 5, 10);
-        dc.fillRectangle(cx - 9, cy + 4, 18, 9);
-        dc.setColor(kitRed, Gfx.COLOR_BLACK);
-        dc.drawLine(cx - 8, cy + 3, cx + 8, cy + 3);
-        dc.setColor(kitGreen, Gfx.COLOR_BLACK);
-        dc.drawLine(cx - 6, cy + 6, cx + 6, cy + 6);
-
-        // Face, ears and close-cropped hair.
-        dc.setColor(skin, Gfx.COLOR_BLACK);
-        dc.fillCircle(cx - 6, cy - 7 + nod, 2);
-        dc.fillCircle(cx + 6, cy - 7 + nod, 2);
-        dc.fillCircle(cx, cy - 7 + nod, 6);
-
-        dc.setColor(skinLight, Gfx.COLOR_BLACK);
-        dc.fillCircle(cx + 2, cy - 6 + nod, 4);
-
-        dc.setColor(hair, Gfx.COLOR_BLACK);
-        dc.drawLine(cx - 4, cy - 11 + nod, cx + 4, cy - 11 + nod);
-        dc.drawLine(cx - 4, cy - 10 + nod, cx - 2, cy - 12 + nod);
-        dc.drawLine(cx - 1, cy - 11 + nod, cx + 1, cy - 12 + nod);
-        dc.drawLine(cx + 2, cy - 11 + nod, cx + 4, cy - 10 + nod);
-
-        dc.setColor(Gfx.COLOR_BLACK, Gfx.COLOR_BLACK);
-
-        if (frame == 1) {
-            dc.drawLine(cx - 3, cy - 7 + nod, cx - 1, cy - 7 + nod);
-            dc.drawLine(cx + 1, cy - 7 + nod, cx + 3, cy - 7 + nod);
-        } else {
-            dc.fillCircle(cx - 2, cy - 7 + nod, 1);
-            dc.fillCircle(cx + 2, cy - 7 + nod, 1);
+    function directionName(index) {
+        if (index < 0) {
+            return "--";
         }
 
-        // Nose and the broad smile used for the compact portrait.
-        dc.drawLine(cx, cy - 6 + nod, cx, cy - 4 + nod);
-        dc.drawLine(cx - 2, cy - 3 + nod, cx + 2, cy - 3 + nod);
+        var names = _cn
+            ? ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+            : ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+
+        return names[index];
     }
 
-    function drawBottomStatus(dc, width, height) {
-        var centerX = (width / 2).toNumber();
-        var frame = _animating ? _animationFrame : 0;
-        var baseY = height - 18;
+    function drawCompassPointer(dc, cx, cy, index) {
+        if (index < 0) {
+            return;
+        }
 
-        drawKipchogeAvatar(dc, centerX - 26, baseY, frame);
-        drawBattery(dc, centerX - 12, height - 22, _battery);
+        var dxs = [0, 1, 1, 1, 0, -1, -1, -1];
+        var dys = [-1, -1, 0, 1, 1, 1, 0, -1];
+        var dx = dxs[index];
+        var dy = dys[index];
+        var px = -dy;
+        var py = dx;
 
-        text(
-            dc,
-            centerX + 9,
-            height - 26,
-            36,
-            18,
-            integer(_battery) + "%",
-            Gfx.COLOR_WHITE,
-            false
-        );
-    }
-
-    function onUpdate(dc) {
-        refreshData();
+        var tipX = cx + dx * 11;
+        var tipY = cy + dy * 11;
+        var tailX = cx - dx * 8;
+        var tailY = cy - dy * 8;
+        var leftX = tipX - dx * 4 + px * 3;
+        var leftY = tipY - dy * 4 + py * 3;
+        var rightX = tipX - dx * 4 - px * 3;
+        var rightY = tipY - dy * 4 - py * 3;
 
         dc.setColor(Gfx.COLOR_WHITE, Gfx.COLOR_BLACK);
-        dc.clear();
-
-        var width = dc.getWidth();
-        var height = dc.getHeight();
-        var centerX = (width / 2).toNumber();
-
-        var clock = Sys.getClockTime();
-        var date = Gregorian.info(
-            Time.now(),
-            Time.FORMAT_SHORT
-        );
-
-        var week = _cn
-            ? ["日", "一", "二", "三", "四", "五", "六"]
-            : ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-
-        var temperature = _weather == null
-            ? null
-            : _weather.temperature;
-
-        var high = _weather == null
-            ? null
-            : _weather.highTemperature;
-
-        var low = _weather == null
-            ? null
-            : _weather.lowTemperature;
-
-        // The upper half remains from the previous approved design.
-        text(
-            dc,
-            45,
-            24,
-            width - 90,
-            21,
-            words("气温 ", "TEMP ") +
-                integer(temperature) + "C  " +
-                integer(low) + "/" + integer(high),
-            Gfx.COLOR_WHITE,
-            true
-        );
-
-        var wind = _weather == null
-            ? null
-            : _weather.windSpeed;
-
-        var humidity = _weather == null
-            ? null
-            : _weather.relativeHumidity;
-
-        text(
-            dc,
-            26,
-            46,
-            width - 52,
-            19,
-            words("风 ", "WIND ") +
-                decimal(wind) + "m/s  " +
-                words("湿 ", "RH ") +
-                integer(humidity) + "%",
-            Gfx.COLOR_LT_GRAY,
-            true
-        );
-
-        text(
-            dc,
-            24,
-            66,
-            width - 48,
-            19,
-            two(date.month) + "/" + two(date.day) +
-                "  " + words("周", "") +
-                week[date.day_of_week - 1],
-            _accent,
-            true
-        );
-
-        if (_lines) {
-            dc.setColor(Gfx.COLOR_DK_GRAY, Gfx.COLOR_BLACK);
-            dc.drawLine(29, 86, width - 29, 86);
-        }
-
-        var hour = clock.hour;
-
-        if (!_hours24) {
-            hour = hour % 12;
-
-            if (hour == 0) {
-                hour = 12;
-            }
-        }
-
-        var timeText = two(hour) + ":" + two(clock.min);
-        var timeFont = Gfx.FONT_NUMBER_HOT;
-
-        if (dc.getTextWidthInPixels(timeText, timeFont) >
-                width - 38 ||
-            dc.getFontHeight(timeFont) > 43) {
-            timeFont = Gfx.FONT_NUMBER_MEDIUM;
-        }
+        dc.drawLine(tailX, tailY, tipX, tipY);
 
         dc.setColor(_accent, Gfx.COLOR_BLACK);
+        dc.drawLine(tipX, tipY, leftX, leftY);
+        dc.drawLine(tipX, tipY, rightX, rightY);
+        dc.fillCircle(tipX, tipY, 1);
+        dc.fillCircle(cx, cy, 2);
+    }
 
+    function drawSun(dc, cx, cy) {
+        dc.setColor(Gfx.COLOR_WHITE, Gfx.COLOR_BLACK);
+        dc.drawCircle(cx, cy, 5);
+        dc.drawLine(cx, cy - 10, cx, cy - 7);
+        dc.drawLine(cx, cy + 7, cx, cy + 10);
+        dc.drawLine(cx - 10, cy, cx - 7, cy);
+        dc.drawLine(cx + 7, cy, cx + 10, cy);
+        dc.drawLine(cx - 7, cy - 7, cx - 5, cy - 5);
+        dc.drawLine(cx + 5, cy + 5, cx + 7, cy + 7);
+        dc.drawLine(cx + 5, cy - 5, cx + 7, cy - 7);
+        dc.drawLine(cx - 7, cy + 7, cx - 5, cy + 5);
+    }
+
+    function drawRing(dc, width, height, cx) {
+        var radius = width < height ? width / 2 - 3 : height / 2 - 3;
+        dc.setColor(_accent, Gfx.COLOR_BLACK);
+        dc.drawCircle(cx, (height / 2).toNumber(), radius);
+
+        // Four unobtrusive reference ticks echo the supplied round design.
+        var cy = (height / 2).toNumber();
+        dc.setColor(Gfx.COLOR_DK_GRAY, Gfx.COLOR_BLACK);
+        dc.drawLine(cx, 4, cx, 9);
+        dc.drawLine(cx, height - 9, cx, height - 4);
+        dc.drawLine(4, cy, 9, cy);
+        dc.drawLine(width - 9, cy, width - 4, cy);
+    }
+
+    function drawClock(dc, centerX, top, hour, minute, width) {
+        var font = Gfx.FONT_NUMBER_HOT;
+        var hourText = two(hour);
+        var minuteText = two(minute);
+        var colonText = ":";
+        var totalText = hourText + colonText + minuteText;
+
+        if (dc.getTextWidthInPixels(totalText, font) > width ||
+            dc.getFontHeight(font) > 43) {
+            font = Gfx.FONT_NUMBER_MEDIUM;
+        }
+
+        var hourWidth = dc.getTextWidthInPixels(hourText, font);
+        var colonWidth = dc.getTextWidthInPixels(colonText, font);
+        var minuteWidth = dc.getTextWidthInPixels(minuteText, font);
+        var totalWidth = hourWidth + colonWidth + minuteWidth;
+        var startX = centerX - (totalWidth / 2).toNumber();
+        var textY = top +
+            ((45 - dc.getFontHeight(font)) / 2).toNumber();
+
+        dc.setColor(_accent, Gfx.COLOR_BLACK);
         dc.drawText(
-            centerX,
-            88 + ((43 - dc.getFontHeight(timeFont)) / 2).toNumber(),
-            timeFont,
-            timeText,
+            startX + (hourWidth / 2).toNumber(),
+            textY,
+            font,
+            hourText,
             Gfx.TEXT_JUSTIFY_CENTER
         );
 
-        var status = _phone
-            ? words("已连接", "LINK")
-            : words("未连接", "OFFLINE");
+        dc.setColor(Gfx.COLOR_WHITE, Gfx.COLOR_BLACK);
+        dc.drawText(
+            startX + hourWidth + (colonWidth / 2).toNumber(),
+            textY,
+            font,
+            colonText,
+            Gfx.TEXT_JUSTIFY_CENTER
+        );
+        dc.drawText(
+            startX + hourWidth + colonWidth +
+                (minuteWidth / 2).toNumber(),
+            textY,
+            font,
+            minuteText,
+            Gfx.TEXT_JUSTIFY_CENTER
+        );
+    }
 
-        if (!_hours24) {
-            status += clock.hour < 12 ? " AM" : " PM";
+    function pixelRow(dc, cx, y, left, right, color) {
+        dc.setColor(color, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - left, y, left + right + 1, 2);
+    }
+
+    // Code-drawn pixel portrait.  It uses the supplied portrait's dark red,
+    // terracotta, orange, green and white palette instead of a generic circle.
+    // Keeping it as code avoids a bitmap resource and leaves room for the
+    // battery percentage on the forehead.
+    function drawKipchogeAvatar(dc, cx, top, frame) {
+        var shift = frame == 2 ? 1 : 0;
+        var outline = 0xF0F0F0;
+        var black = 0x171318;
+        var skinShadow = 0x6B3032;
+        var skinDark = 0x8D4035;
+        var skin = 0xB85A3D;
+        var skinMid = 0xC96A43;
+        var skinLight = 0xDA804C;
+        var green = 0x6AD17A;
+        var shirt = 0x2B2837;
+        var shirtShadow = 0x181622;
+        var vest = 0x4D2630;
+
+        // Shoulders and shirt are behind the head and neck.
+        dc.setColor(outline, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 27, top + 34, 54, 8);
+        dc.setColor(shirtShadow, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 25, top + 34, 50, 8);
+        dc.setColor(shirt, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 21, top + 33, 42, 9);
+        dc.setColor(vest, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 18, top + 33, 7, 9);
+        dc.fillRectangle(cx + 11, top + 33, 7, 9);
+
+        // Neck, with a white shirt edge at the bottom.
+        dc.setColor(outline, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 10, top + 26 + shift, 20, 16 - shift);
+        dc.setColor(skinShadow, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 8, top + 27 + shift, 16, 13 - shift);
+        dc.setColor(skin, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 5, top + 27 + shift, 10, 13 - shift);
+        dc.setColor(0xE8E0D0, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 8, top + 40, 16, 2);
+
+        // White pixel outline around the head.
+        pixelRow(dc, cx, top + shift, 8, 8, outline);
+        pixelRow(dc, cx, top + 2 + shift, 14, 14, outline);
+        pixelRow(dc, cx, top + 4 + shift, 18, 18, outline);
+        pixelRow(dc, cx, top + 6 + shift, 20, 20, outline);
+        pixelRow(dc, cx, top + 8 + shift, 21, 21, outline);
+        pixelRow(dc, cx, top + 10 + shift, 22, 22, outline);
+        pixelRow(dc, cx, top + 12 + shift, 22, 22, outline);
+        pixelRow(dc, cx, top + 14 + shift, 23, 23, outline);
+        pixelRow(dc, cx, top + 16 + shift, 23, 23, outline);
+        pixelRow(dc, cx, top + 18 + shift, 23, 23, outline);
+        pixelRow(dc, cx, top + 20 + shift, 22, 22, outline);
+        pixelRow(dc, cx, top + 22 + shift, 21, 21, outline);
+        pixelRow(dc, cx, top + 24 + shift, 19, 19, outline);
+        pixelRow(dc, cx, top + 26 + shift, 16, 16, outline);
+        pixelRow(dc, cx, top + 28 + shift, 12, 12, outline);
+
+        // Face fill, keeping the pixel-step silhouette.
+        pixelRow(dc, cx, top + 2 + shift, 7, 7, skinDark);
+        pixelRow(dc, cx, top + 4 + shift, 12, 12, skin);
+        pixelRow(dc, cx, top + 6 + shift, 16, 16, skin);
+        pixelRow(dc, cx, top + 8 + shift, 18, 18, skinMid);
+        pixelRow(dc, cx, top + 10 + shift, 19, 19, skinMid);
+        pixelRow(dc, cx, top + 12 + shift, 20, 20, skin);
+        pixelRow(dc, cx, top + 14 + shift, 21, 21, skin);
+        pixelRow(dc, cx, top + 16 + shift, 21, 21, skinMid);
+        pixelRow(dc, cx, top + 18 + shift, 21, 21, skinMid);
+        pixelRow(dc, cx, top + 20 + shift, 20, 20, skin);
+        pixelRow(dc, cx, top + 22 + shift, 19, 19, skin);
+        pixelRow(dc, cx, top + 24 + shift, 17, 17, skinDark);
+        pixelRow(dc, cx, top + 26 + shift, 14, 14, skinShadow);
+        pixelRow(dc, cx, top + 28 + shift, 10, 10, skinShadow);
+
+        // Ears and the green edge visible in the supplied artwork.
+        dc.setColor(outline, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 25, top + 13 + shift, 5, 10);
+        dc.fillRectangle(cx + 20, top + 13 + shift, 5, 10);
+        dc.setColor(skinDark, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 23, top + 14 + shift, 4, 8);
+        dc.fillRectangle(cx + 19, top + 14 + shift, 4, 8);
+        dc.setColor(green, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 21, top + 7 + shift, 2, 8);
+        dc.fillRectangle(cx + 19, top + 7 + shift, 2, 8);
+        dc.fillRectangle(cx - 20, top + 23 + shift, 2, 5);
+        dc.fillRectangle(cx + 18, top + 23 + shift, 2, 5);
+
+        // Head shading and the close-cropped hair line.
+        dc.setColor(skinShadow, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 17, top + 7 + shift, 6, 18);
+        dc.fillRectangle(cx - 12, top + 23 + shift, 5, 6);
+        dc.setColor(skinLight, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx + 10, top + 9 + shift, 8, 13);
+        dc.fillRectangle(cx + 7, top + 21 + shift, 9, 5);
+        dc.setColor(black, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 11, top + 3 + shift, 22, 3);
+        dc.fillRectangle(cx - 16, top + 6 + shift, 7, 2);
+        dc.fillRectangle(cx + 9, top + 6 + shift, 7, 2);
+
+        // Brows.
+        dc.fillRectangle(cx - 15, top + 11 + shift, 10, 2);
+        dc.fillRectangle(cx + 5, top + 11 + shift, 10, 2);
+
+        var eyeY = top + 14 + shift;
+
+        if (frame == 1) {
+            // Single blink frame: both eyelids close briefly.
+            dc.setColor(black, Gfx.COLOR_BLACK);
+            dc.fillRectangle(cx - 14, eyeY + 2, 10, 2);
+            dc.fillRectangle(cx + 4, eyeY + 2, 10, 2);
+            dc.setColor(skinLight, Gfx.COLOR_BLACK);
+            dc.fillRectangle(cx - 11, eyeY + 4, 5, 2);
+            dc.fillRectangle(cx + 7, eyeY + 4, 5, 2);
+        } else {
+            // Open eyes with the black/brown outline and small white highlights.
+            dc.setColor(black, Gfx.COLOR_BLACK);
+            dc.fillRectangle(cx - 14, eyeY + 1, 11, 5);
+            dc.fillRectangle(cx + 3, eyeY + 1, 11, 5);
+            dc.setColor(0xF0D5B0, Gfx.COLOR_BLACK);
+            dc.fillRectangle(cx - 11, eyeY + 2, 6, 3);
+            dc.fillRectangle(cx + 6, eyeY + 2, 6, 3);
+            dc.setColor(black, Gfx.COLOR_BLACK);
+            dc.fillRectangle(cx - 8, eyeY + 1, 3, 4);
+            dc.fillRectangle(cx + 8, eyeY + 1, 3, 4);
+            dc.setColor(Gfx.COLOR_WHITE, Gfx.COLOR_BLACK);
+            dc.fillRectangle(cx - 7, eyeY + 1, 1, 1);
+            dc.fillRectangle(cx + 9, eyeY + 1, 1, 1);
         }
 
-        if (_seconds && _awake) {
-            status += "  " + two(clock.sec) + "s";
-        }
+        // Nose and a calm, slightly smiling mouth.
+        dc.setColor(skinLight, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx + 1, top + 18 + shift, 6, 6);
+        dc.setColor(skinShadow, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 2, top + 22 + shift, 9, 2);
+        dc.setColor(black, Gfx.COLOR_BLACK);
+        dc.drawLine(cx - 10, top + 26 + shift, cx - 3, top + 27 + shift);
+        dc.drawLine(cx - 3, top + 27 + shift, cx + 8, top + 26 + shift);
+        dc.setColor(skinLight, Gfx.COLOR_BLACK);
+        dc.fillRectangle(cx - 5, top + 28 + shift, 10, 2);
 
+        // Battery percentage on the forehead, as requested.
+        var batteryText = _battery == null
+            ? "--"
+            : integer(_battery) + "%";
         text(
             dc,
-            32,
-            132,
-            width - 64,
-            16,
-            status,
-            Gfx.COLOR_LT_GRAY,
+            cx - 10,
+            top + 6 + shift,
+            20,
+            9,
+            batteryText,
+            _accent,
             true
         );
+    }
 
-        // Fixed two-column, three-row lower grid for the approved layout.
-        var gridTop = 151;
-        var rowHeight = 21;
+    function drawBottomPortrait(dc, width, height) {
+        var centerX = (width / 2).toNumber();
+        var top = height - 42;
+        var frame = _animating ? _animationFrame : 0;
+
+        // Small colored bars retain the lower decorative character of the
+        // supplied reference without taking space from the portrait.
+        dc.setColor(_accent, Gfx.COLOR_BLACK);
+        dc.drawLine(27, top + 2, centerX - 31, top + 2);
+        dc.setColor(0xFF1493, Gfx.COLOR_BLACK);
+        dc.drawLine(centerX + 31, top + 2, width - 27, top + 2);
+
+        drawKipchogeAvatar(dc, centerX, top, frame);
+    }
+
+    function drawLowerGrid(dc, width, height) {
+        var gridTop = 163;
+        var rowHeight = 18;
         var gridLeft = 18;
         var gridRight = width - 18;
         var gridWidth = gridRight - gridLeft;
@@ -673,7 +825,6 @@ class KnightFace extends Ui.WatchFace {
                 columnWidth - 6,
                 _slots[row * 2]
             );
-
             dataCell(
                 dc,
                 gridCenter + 3,
@@ -704,10 +855,184 @@ class KnightFace extends Ui.WatchFace {
                 gridTop + rowHeight * 2
             );
         }
+    }
 
-        drawBottomStatus(dc, width, height);
+    function onUpdate(dc) {
+        refreshData();
+        refreshHeading();
 
-        if (_animating) {
+        dc.setColor(Gfx.COLOR_WHITE, Gfx.COLOR_BLACK);
+        dc.clear();
+
+        var width = dc.getWidth();
+        var height = dc.getHeight();
+        var centerX = (width / 2).toNumber();
+
+        drawRing(dc, width, height, centerX);
+
+        var clock = Sys.getClockTime();
+        var date = Gregorian.info(
+            Time.now(),
+            Time.FORMAT_SHORT
+        );
+
+        var week = _cn
+            ? ["日", "一", "二", "三", "四", "五", "六"]
+            : ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+        var weekday = date.day_of_week;
+
+        if (weekday < 1 || weekday > 7) {
+            weekday = 1;
+        }
+
+        var temperature = _weather == null
+            ? null
+            : _weather.temperature;
+        var high = _weather == null
+            ? null
+            : _weather.highTemperature;
+        var low = _weather == null
+            ? null
+            : _weather.lowTemperature;
+        var wind = _weather == null
+            ? null
+            : _weather.windSpeed;
+        var humidity = _weather == null
+            ? null
+            : _weather.relativeHumidity;
+
+        // Weather band.
+        text(
+            dc,
+            25,
+            18,
+            66,
+            18,
+            integerUnit(temperature, "C"),
+            Gfx.COLOR_WHITE,
+            true
+        );
+        text(
+            dc,
+            25,
+            37,
+            66,
+            16,
+            integerUnit(low, "C") + "/" + integerUnit(high, "C"),
+            Gfx.COLOR_LT_GRAY,
+            true
+        );
+        text(
+            dc,
+            91,
+            18,
+            93,
+            17,
+            words("风 ", "WIND ") + decimalUnit(wind, "m/s"),
+            Gfx.COLOR_WHITE,
+            true
+        );
+        text(
+            dc,
+            91,
+            37,
+            93,
+            17,
+            words("湿度 ", "RH ") + integerUnit(humidity, "%"),
+            Gfx.COLOR_WHITE,
+            true
+        );
+        drawSun(dc, width - 43, 27);
+        text(
+            dc,
+            width - 68,
+            39,
+            50,
+            15,
+            words("晴", "CLEAR"),
+            Gfx.COLOR_WHITE,
+            true
+        );
+
+        // Date line.
+        text(
+            dc,
+            41,
+            62,
+            width - 82,
+            19,
+            two(date.month) + "/" + two(date.day) +
+                " " + words("周", "") + week[weekday - 1],
+            _accent,
+            true
+        );
+
+        if (_lines) {
+            dc.setColor(Gfx.COLOR_DK_GRAY, Gfx.COLOR_BLACK);
+            dc.drawLine(35, 84, width - 35, 84);
+        }
+
+        var hour = clock.hour;
+
+        if (!_hours24) {
+            hour = hour % 12;
+
+            if (hour == 0) {
+                hour = 12;
+            }
+        }
+
+        // Large two-color clock, matching the supplied cyan/white reference.
+        drawClock(dc, centerX + 18, 88, hour, clock.min, width - 78);
+
+        var sector = directionIndex();
+        drawCompassPointer(dc, centerX - 71, 111, sector);
+        text(
+            dc,
+            centerX - 91,
+            123,
+            40,
+            16,
+            directionName(sector),
+            Gfx.COLOR_WHITE,
+            true
+        );
+
+        // Seconds are shown only during the high-power wrist-raise period.
+        if (_seconds && _awake) {
+            text(
+                dc,
+                centerX + 78,
+                111,
+                25,
+                18,
+                two(clock.sec),
+                Gfx.COLOR_WHITE,
+                true
+            );
+        }
+
+        var status = _phone
+            ? words("已连接", "LINK")
+            : words("未连接", "OFFLINE");
+        text(
+            dc,
+            72,
+            140,
+            width - 144,
+            16,
+            status,
+            Gfx.COLOR_LT_GRAY,
+            true
+        );
+
+        drawLowerGrid(dc, width, height);
+        drawBottomPortrait(dc, width, height);
+
+        // The system calls onUpdate once per second while the watch face is
+        // awake.  Requesting one more update keeps the three portrait frames
+        // visible on devices that coalesce a frame.
+        if (_animating && _awake) {
             if (_animationFrame < 2) {
                 _animationFrame += 1;
                 Ui.requestUpdate();
